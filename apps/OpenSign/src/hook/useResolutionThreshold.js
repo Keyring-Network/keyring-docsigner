@@ -38,12 +38,6 @@ export function useResolutionThreshold(documentId) {
         setLoading(true);
         setError(null);
 
-        const docPtr = {
-          __type: "Pointer",
-          className: "contracts_Document",
-          objectId: documentId
-        };
-
         // 1. Fetch resolutions_Threshold
         const tQuery = new Parse.Query("resolutions_Threshold");
         tQuery.equalTo("document", {

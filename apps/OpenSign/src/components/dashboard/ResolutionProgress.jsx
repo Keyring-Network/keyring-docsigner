@@ -34,13 +34,13 @@ const ResolutionProgress = ({ documentId }) => {
         );
       case "EXECUTED":
         return (
-          <span className="op-badge text-[10px] px-1.5 py-0.5 rounded font-semibold bg-success text-success-content">
+          <span className="op-badge op-badge-success text-[10px] px-1.5 py-0.5 rounded font-semibold">
             EXECUTED
           </span>
         );
       case "CANCELLED":
         return (
-          <span className="op-badge text-[10px] px-1.5 py-0.5 rounded font-semibold bg-error text-error-content">
+          <span className="op-badge op-badge-error text-[10px] px-1.5 py-0.5 rounded font-semibold">
             CANCELLED
           </span>
         );
