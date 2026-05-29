@@ -571,6 +571,11 @@ export const addWidgetOptions = (
       return defaultOpt;
     case drawWidget:
       return defaultOpt;
+    case "weight factor":
+      return {
+        ...defaultOpt,
+        label: "Weight Factor"
+      };
     default:
       return {};
   }
