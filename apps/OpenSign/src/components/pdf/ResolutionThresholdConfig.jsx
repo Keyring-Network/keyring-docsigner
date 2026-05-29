@@ -20,7 +20,7 @@ const ResolutionThresholdConfig = ({ signers, documentId, onSaved }) => {
 
   // Keyed by signer index: { weightA: number, weightB: number, excludedFromB: bool }
   const [signerConfig, setSignerConfig] = useState(() =>
-    (signers || []).map(() => ({ weightA: 1, weightB: 1, excludedFromB: false }))
+    (signers || []).map(() => ({ weightGroupA: 1, weightGroupB: 1, excludedFromB: false }))
   );
 
   const [isSaving, setIsSaving] = useState(false);
@@ -55,9 +55,9 @@ const ResolutionThresholdConfig = ({ signers, documentId, onSaved }) => {
     const signersPayload = (signers || []).map((signer, i) => ({
       name: signer.Name || signer.Role || "",
       email: signer.Email || signer.email || "",
-      weightA: signerConfig[i]?.weightA ?? 1,
-      weightB: signerConfig[i]?.weightB ?? 1,
-      excludedFromGroupB: signerConfig[i]?.excludedFromB ?? false
+      weightGroupA: signerConfig[i]?.weightGroupA ?? 1,
+      weightGroupB: signerConfig[i]?.weightGroupB ?? 1,
+      excludedFromB: signerConfig[i]?.excludedFromB ?? false
     }));
 
     const params = {
@@ -170,8 +170,8 @@ const ResolutionThresholdConfig = ({ signers, documentId, onSaved }) => {
                           min={0}
                           max={100}
                           step={0.01}
-                          value={signerConfig[i]?.weightA ?? 1}
-                          onChange={(e) => handleWeightChange(i, "weightA", e.target.value)}
+                          value={signerConfig[i]?.weightGroupA ?? 1}
+                          onChange={(e) => handleWeightChange(i, "weightGroupA", e.target.value)}
                           className="op-input op-input-bordered op-input-xs w-[60px] text-center text-[11px]"
                         />
                       </td>
@@ -181,8 +181,8 @@ const ResolutionThresholdConfig = ({ signers, documentId, onSaved }) => {
                           min={0}
                           max={100}
                           step={0.01}
-                          value={signerConfig[i]?.weightB ?? 1}
-                          onChange={(e) => handleWeightChange(i, "weightB", e.target.value)}
+                          value={signerConfig[i]?.weightGroupB ?? 1}
+                          onChange={(e) => handleWeightChange(i, "weightGroupB", e.target.value)}
                           disabled={signerConfig[i]?.excludedFromB}
                           className="op-input op-input-bordered op-input-xs w-[60px] text-center text-[11px] disabled:opacity-40"
                         />
