@@ -421,7 +421,8 @@
     "image": "image",
     "email": "e-mail",
     "number": "nombre",
-    "draw": "Dessiner"
+    "draw": "Dessiner",
+    "weight factor": "Facteur de pondération"
   },
   "fields": "Des champs",
   "recipients": "Destinataires",

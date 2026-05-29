@@ -47,7 +47,8 @@ const WidgetNameModal = (props) => {
         "name",
         "company",
         "job title",
-        "email"
+        "email",
+        "weight factor"
       ].includes(props.defaultdata?.type),
     [type]
   );

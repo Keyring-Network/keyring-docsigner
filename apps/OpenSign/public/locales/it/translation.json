@@ -421,7 +421,8 @@
     "image": "immagine",
     "email": "email",
     "number": "numero",
-    "draw": "Disegno"
+    "draw": "Disegno",
+    "weight factor": "Fattore di ponderazione"
   },
   "fields": "Campi",
   "recipients": "Destinatari",

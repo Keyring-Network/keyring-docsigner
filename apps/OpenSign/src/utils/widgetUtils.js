@@ -452,6 +452,7 @@ export const isWidgetResponseCompatible = (widget, newResponse = "") => {
     case "company":
     case "job title":
     case "email":
+    case "weight factor":
       return typeof response === "string" || typeof response === "number";
 
     default:

@@ -507,6 +507,30 @@ function PlaceholderType(props) {
           <span className="ml-0.5">{formatWidgetName()}</span>
         </div>
       );
+    case "weight factor":
+      return iswidgetEnable ? (
+        <textarea
+          readOnly
+          placeholder={props?.pos?.options?.label || formatWidgetName()}
+          rows={1}
+          value={
+                widgetValue
+          }
+          className={`${textWidgetCls} ${isReadOnly ? "select-none" : ""}`}
+          style={{
+            fontSize: fontSize,
+            color: fontColor,
+            background: isReadOnly ? props.data?.blockColor : "white",
+            pointerEvents: "none"
+          }}
+          cols="50"
+          disabled={props.isNeedSign && isReadOnly}
+        />
+      ) : (
+        <div style={textWidgetStyle} className="select-none-cls">
+          <span className="ml-0.5">{props?.pos?.options?.label || formatWidgetName()}</span>
+        </div>
+      );
     case "date":
       return iswidgetEnable || props?.data?.Role === "prefill" ? (
         <div className={`${selectWidgetCls} outline-[#007bff]`}>

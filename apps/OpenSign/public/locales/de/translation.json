@@ -421,7 +421,8 @@
     "image": "Bild",
     "email": "E-Mail",
     "number": "Zahl",
-    "draw": "Zeichnen"
+    "draw": "Zeichnen",
+    "weight factor": "Gewichtungsfaktor"
   },
   "fields": "Felder",
   "recipients": "Empfänger",
