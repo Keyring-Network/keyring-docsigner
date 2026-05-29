@@ -82,12 +82,11 @@ Parse.Cloud.define('initResolutionsSchema', async req => {
       }
     }
 
-    // Set CLPs: cloud code (master key) can write; authenticated users can read
-    const readAuthOnly = { requiresAuthentication: true };
+    // Set CLPs: master key only for all operations (cloud code reads/writes only)
     const masterOnly = {};
     const clp = {
-      get: readAuthOnly,
-      find: readAuthOnly,
+      get: masterOnly,
+      find: masterOnly,
       create: masterOnly,
       update: masterOnly,
       delete: masterOnly,
@@ -106,6 +105,121 @@ Parse.Cloud.define('initResolutionsSchema', async req => {
     console.error('[resolutions] initResolutionsSchema error:', err);
     throw err;
   }
+});
+
+// ─── A2. getResolutionProgress — public progress endpoint ────────────────────
+
+Parse.Cloud.define('getResolutionProgress', async req => {
+  const { documentId } = req.params;
+  if (!documentId) {
+    throw new Parse.Error(Parse.Error.INVALID_QUERY, 'documentId is required');
+  }
+  if (!req.user && !req.master) {
+    throw new Parse.Error(Parse.Error.INVALID_SESSION_TOKEN, 'Authentication required.');
+  }
+
+  const docPtr = { __type: 'Pointer', className: 'contracts_Document', objectId: documentId };
+
+  const tQuery = new Parse.Query('resolutions_Threshold');
+  tQuery.equalTo('document', docPtr);
+  const threshold = await tQuery.first({ useMasterKey: true });
+  if (!threshold) return null;
+
+  const thresholdA = threshold.get('thresholdA') ?? 0.75;
+  const thresholdB = threshold.get('thresholdB') ?? 0.50;
+  const status = threshold.get('status') || 'DRAFT';
+
+  const swQuery = new Parse.Query('resolutions_SignerWeight');
+  swQuery.equalTo('document', docPtr);
+  swQuery.limit(1000);
+  const signerWeights = await swQuery.find({ useMasterKey: true });
+
+  // Resolve signed emails using AuditTrail objectId → Signers → email
+  const docQuery = new Parse.Query('contracts_Document');
+  docQuery.include('Signers');
+  const doc = await docQuery.get(documentId, { useMasterKey: true });
+  const auditTrail = doc.get('AuditTrail') || [];
+  const completionActivities = ['Signed', 'Approved'];
+
+  const signedSignerObjectIds = new Set(
+    auditTrail
+      .filter(entry => completionActivities.includes(entry?.Activity))
+      .map(entry => entry?.UserPtr?.objectId)
+      .filter(Boolean)
+  );
+
+  const docSigners = doc.get('Signers') || [];
+  const signedEmails = new Set();
+  for (const signer of docSigners) {
+    const signerId = signer?.objectId || signer?.id;
+    if (signerId && signedSignerObjectIds.has(signerId)) {
+      const email = signer?.get?.('Email') || signer?.Email;
+      if (email) signedEmails.add(email.toLowerCase());
+    }
+  }
+
+  if (signedEmails.size === 0 && signedSignerObjectIds.size > 0) {
+    for (const objId of signedSignerObjectIds) {
+      try {
+        const contact = await new Parse.Query('contracts_Contactbook').get(objId, { useMasterKey: true });
+        const email = contact?.get('Email');
+        if (email) signedEmails.add(email.toLowerCase());
+      } catch { /* not found — skip */ }
+    }
+  }
+
+  let totalA = 0, signedA = 0, totalB = 0, signedB = 0;
+  for (const sw of signerWeights) {
+    const email = (sw.get('signerEmail') || '').toLowerCase();
+    const wA = sw.get('weightGroupA') ?? 0;
+    const wB = sw.get('weightGroupB') ?? 0;
+    const excluded = sw.get('excludedFromB') ?? false;
+    const hasSigned = signedEmails.has(email);
+    totalA += wA;
+    if (hasSigned) signedA += wA;
+    if (!excluded) {
+      totalB += wB;
+      if (hasSigned) signedB += wB;
+    }
+  }
+
+  return {
+    threshold: { thresholdA, thresholdB, status },
+    groupAPercent: totalA > 0 ? (signedA / totalA) * 100 : 0,
+    groupBPercent: totalB > 0 ? (signedB / totalB) * 100 : 0,
+  };
+});
+
+// ─── A3. getResolutionConfig — admin config read endpoint ───────────────────
+
+Parse.Cloud.define('getResolutionConfig', async req => {
+  await requireAdmin(req);
+  const { documentId } = req.params;
+  if (!documentId) {
+    throw new Parse.Error(Parse.Error.INVALID_QUERY, 'documentId is required');
+  }
+
+  const docPtr = { __type: 'Pointer', className: 'contracts_Document', objectId: documentId };
+
+  const tQuery = new Parse.Query('resolutions_Threshold');
+  tQuery.equalTo('document', docPtr);
+  const threshold = await tQuery.first({ useMasterKey: true });
+
+  const swQuery = new Parse.Query('resolutions_SignerWeight');
+  swQuery.equalTo('document', docPtr);
+  swQuery.limit(1000);
+  const weights = await swQuery.find({ useMasterKey: true });
+
+  return {
+    thresholdA: threshold ? Math.round((threshold.get('thresholdA') ?? 0.75) * 100) : 75,
+    thresholdB: threshold ? Math.round((threshold.get('thresholdB') ?? 0.50) * 100) : 50,
+    signerWeights: weights.map(sw => ({
+      email: sw.get('signerEmail') || '',
+      weightGroupA: sw.get('weightGroupA') ?? 1,
+      weightGroupB: sw.get('weightGroupB') ?? 1,
+      excludedFromB: sw.get('excludedFromB') ?? false,
+    })),
+  };
 });
 
 // ─── B. checkThresholds(documentId) ──────────────────────────────────────────
@@ -453,21 +567,95 @@ function stampExecutedBanner(pdfDoc, font, executedAt) {
 
 /**
  * Marks the resolution as EXECUTED:
- *  1. Updates resolutions_Threshold status → EXECUTED and stamps executedAt on the document
- *  2. Fetches the latest signed PDF, loads it with pdf-lib
- *  3. For each signer that signed, overlays their field responses (signature images + text)
- *  4. Stamps an EXECUTED banner on every page
- *  5. Uploads the executed PDF and stores its URL as contracts_Document.ExecutedFileUrl
- *  6. Sends execution confirmation emails to all signers and the document owner
- *
- * PDF generation failures are non-fatal: the document is still marked EXECUTED and
- * notification emails are still sent.  The PDF can be regenerated separately.
+ *  1. Generates the executed PDF overlay (fatal — execution aborts if this fails)
+ *  2. Updates resolutions_Threshold status → EXECUTED, stamps executedAt, and stores
+ *     ExecutedFileUrl + SignedUrl on the document (fatal)
+ *  3. Sends execution confirmation emails to all signers and the document owner (non-fatal)
  */
 async function executeDocument(documentId) {
   const executedAt = new Date();
   const docPtr = { __type: 'Pointer', className: 'contracts_Document', objectId: documentId };
 
-  // ── Step 1: mark EXECUTED immediately (fatal if this fails) ─────────────────
+  // ── Step 1: generate the executed PDF (fatal — execution aborts if this fails) ──
+  let executedFileUrl = null;
+
+  // Fetch the document with all related signer and placeholder data
+  const docQuery = new Parse.Query('contracts_Document');
+  docQuery.include('ExtUserPtr');
+  docQuery.include('Signers');
+  const doc = await docQuery.get(documentId, { useMasterKey: true });
+
+  const _doc = doc.toJSON();
+
+  // Use the most recent signed PDF, falling back to the original upload
+  const pdfUrl = _doc.SignedUrl || _doc.URL;
+  if (!pdfUrl) {
+    throw new Error('Document has no PDF URL (SignedUrl or URL)');
+  }
+  if (!pdfUrl.startsWith('https://')) {
+    throw new Error('PDF URL must use HTTPS');
+  }
+
+  // Download the PDF bytes
+  const pdfResponse = await axios.get(pdfUrl, {
+    responseType: 'arraybuffer',
+    maxContentLength: 50 * 1024 * 1024,
+    maxBodyLength: 50 * 1024 * 1024,
+    timeout: 30000,
+  });
+  const pdfBytes = Buffer.from(pdfResponse.data);
+
+  // Load the document
+  const pdfDoc = await PDFDocument.load(pdfBytes, { ignoreEncryption: true });
+
+  // Embed a font for text overlays.  Use the same Times New Roman TTF used
+  // elsewhere in the codebase (GenerateCertificate.js).
+  pdfDoc.registerFontkit(fontkit);
+  let font;
+  const localFontPath = './font/times.ttf';
+  if (fs.existsSync(localFontPath)) {
+    const fontBytesData = fs.readFileSync(localFontPath);
+    font = await pdfDoc.embedFont(fontBytesData, { subset: true });
+  } else {
+    // Fall back to the standard Times-Roman Type-1 font if the TTF is absent
+    const { StandardFonts } = await import('pdf-lib');
+    font = await pdfDoc.embedFont(StandardFonts.TimesRoman);
+  }
+
+  // Build the signer data map and overlay each signer's fields
+  const signerMap = buildSignerDataMap(_doc);
+  for (const signerData of Object.values(signerMap)) {
+    if (signerData.placeholder) {
+      await overlaySignerFields(pdfDoc, signerData.placeholder, signerData, font);
+    }
+  }
+
+  // Stamp the EXECUTED banner on every page
+  stampExecutedBanner(pdfDoc, font, executedAt);
+
+  // Serialise to bytes
+  const executedPdfBytes = await pdfDoc.save({ useObjectStreams: false });
+
+  // Upload via the Parse file API (same pattern as PDF.js / generateCertificatebydocId.js)
+  const docName = (_doc.Name || 'resolution')
+    .replace(/[^a-zA-Z0-9._-]/g, '_')
+    .toLowerCase()
+    .slice(0, 80);
+  const uploadFilename = `executed_${docName}_${documentId}.pdf`;
+
+  const fileRes = await parseUploadFile(
+    uploadFilename,
+    Buffer.from(executedPdfBytes),
+    'application/pdf'
+  );
+  executedFileUrl = getSecureUrl(fileRes?.url)?.url || fileRes?.url;
+
+  if (!executedFileUrl) {
+    throw new Error('Failed to upload executed PDF');
+  }
+  console.log(`[resolutions] Executed PDF stored: ${executedFileUrl}`);
+
+  // ── Step 2: mark EXECUTED + persist executedFileUrl (fatal) ──────────────────
   try {
     const tQuery = new Parse.Query('resolutions_Threshold');
     tQuery.equalTo('document', docPtr);
@@ -480,90 +668,12 @@ async function executeDocument(documentId) {
     const docObj = new Parse.Object('contracts_Document');
     docObj.id = documentId;
     docObj.set('executedAt', executedAt);
+    docObj.set('ExecutedFileUrl', executedFileUrl);
+    docObj.set('SignedUrl', executedFileUrl); // update so existing download paths work
     await docObj.save(null, { useMasterKey: true });
   } catch (err) {
     console.error('[resolutions] executeDocument — failed to mark EXECUTED:', err);
     throw err;
-  }
-
-  // ── Step 2: generate the executed PDF overlay (non-fatal) ───────────────────
-  try {
-    // Fetch the document with all related signer and placeholder data
-    const docQuery = new Parse.Query('contracts_Document');
-    docQuery.include('ExtUserPtr');
-    docQuery.include('Signers');
-    const doc = await docQuery.get(documentId, { useMasterKey: true });
-
-    const _doc = doc.toJSON();
-
-    // Use the most recent signed PDF, falling back to the original upload
-    const pdfUrl = _doc.SignedUrl || _doc.URL;
-    if (!pdfUrl) {
-      throw new Error('Document has no PDF URL (SignedUrl or URL)');
-    }
-
-    // Download the PDF bytes
-    const pdfResponse = await axios.get(pdfUrl, { responseType: 'arraybuffer' });
-    const pdfBytes = Buffer.from(pdfResponse.data);
-
-    // Load the document
-    const pdfDoc = await PDFDocument.load(pdfBytes, { ignoreEncryption: true });
-
-    // Embed a font for text overlays.  Use the same Times New Roman TTF used
-    // elsewhere in the codebase (GenerateCertificate.js).
-    pdfDoc.registerFontkit(fontkit);
-    let font;
-    const localFontPath = './font/times.ttf';
-    if (fs.existsSync(localFontPath)) {
-      const fontBytesData = fs.readFileSync(localFontPath);
-      font = await pdfDoc.embedFont(fontBytesData, { subset: true });
-    } else {
-      // Fall back to the standard Times-Roman Type-1 font if the TTF is absent
-      const { StandardFonts } = await import('pdf-lib');
-      font = await pdfDoc.embedFont(StandardFonts.TimesRoman);
-    }
-
-    // Build the signer data map and overlay each signer's fields
-    const signerMap = buildSignerDataMap(_doc);
-    for (const signerData of Object.values(signerMap)) {
-      if (signerData.placeholder) {
-        await overlaySignerFields(pdfDoc, signerData.placeholder, signerData, font);
-      }
-    }
-
-    // Stamp the EXECUTED banner on every page
-    stampExecutedBanner(pdfDoc, font, executedAt);
-
-    // Serialise to bytes
-    const executedPdfBytes = await pdfDoc.save({ useObjectStreams: false });
-
-    // Upload via the Parse file API (same pattern as PDF.js / generateCertificatebydocId.js)
-    const docName = (_doc.Name || 'resolution')
-      .replace(/[^a-zA-Z0-9._-]/g, '_')
-      .toLowerCase()
-      .slice(0, 80);
-    const uploadFilename = `executed_${docName}_${documentId}.pdf`;
-
-    const fileRes = await parseUploadFile(
-      uploadFilename,
-      Buffer.from(executedPdfBytes),
-      'application/pdf'
-    );
-    const executedFileUrl = getSecureUrl(fileRes?.url)?.url || fileRes?.url;
-
-    if (executedFileUrl) {
-      const updateDoc = new Parse.Object('contracts_Document');
-      updateDoc.id = documentId;
-      updateDoc.set('ExecutedFileUrl', executedFileUrl);
-      await updateDoc.save(null, { useMasterKey: true });
-      console.log(`[resolutions] Executed PDF stored: ${executedFileUrl}`);
-    }
-  } catch (pdfErr) {
-    // PDF generation failure is non-fatal; log and fall through to notifications
-    console.error(
-      '[resolutions] executeDocument — PDF generation failed (document still EXECUTED):',
-      pdfErr?.message || pdfErr
-    );
   }
 
   // ── Step 3: send notification emails (non-fatal) ─────────────────────────────
@@ -851,6 +961,14 @@ Parse.Cloud.define('importResolutionSchema', async req => {
         throw new Parse.Error(
           Parse.Error.INVALID_QUERY,
           `fields[${i}].signerEmail is required`
+        );
+      }
+      // Validate signerEmail exists in signers[]
+      const emailNorm = (f.signerEmail || '').toLowerCase();
+      if (!signerEmailSet.has(emailNorm)) {
+        throw new Parse.Error(
+          Parse.Error.INVALID_QUERY,
+          `fields[${i}].signerEmail "${f.signerEmail}" is not in signers[]`
         );
       }
       if (f.type && !validFieldTypes.includes(f.type)) {
