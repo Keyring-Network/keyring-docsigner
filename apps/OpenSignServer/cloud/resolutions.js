@@ -18,9 +18,27 @@ import axios from 'axios';
 const serverUrl = cloudServerUrl;
 const appId = serverAppId;
 
+// ─── Auth helper ─────────────────────────────────────────────────────────────
+
+async function requireAdmin(req) {
+  if (req.master) return;
+  if (!req.user) {
+    throw new Parse.Error(Parse.Error.INVALID_SESSION_TOKEN, 'Authentication required.');
+  }
+  const email = req.user.get('email') || req.user.get('username');
+  const extUserQuery = new Parse.Query('contracts_Users');
+  extUserQuery.equalTo('Email', email);
+  const extUser = await extUserQuery.first({ useMasterKey: true });
+  const role = extUser?.get('UserRole');
+  if (role !== 'contracts_Admin' && role !== 'contracts_OrgAdmin') {
+    throw new Parse.Error(Parse.Error.OPERATION_FORBIDDEN, 'Admin role required.');
+  }
+}
+
 // ─── A. Schema initialisation ────────────────────────────────────────────────
 
 Parse.Cloud.define('initResolutionsSchema', async req => {
+  await requireAdmin(req);
   try {
     // resolutions_Threshold
     const thresholdSchema = new Parse.Schema('resolutions_Threshold');
@@ -58,6 +76,25 @@ Parse.Cloud.define('initResolutionsSchema', async req => {
       } else {
         throw err;
       }
+    }
+
+    // Set CLPs: cloud code (master key) can write; authenticated users can read
+    const readAuthOnly = { requiresAuthentication: true };
+    const masterOnly = {};
+    const clp = {
+      get: readAuthOnly,
+      find: readAuthOnly,
+      create: masterOnly,
+      update: masterOnly,
+      delete: masterOnly,
+      addField: masterOnly,
+      protectedFields: { '*': [] },
+    };
+    try {
+      await new Parse.Schema('resolutions_Threshold').setCLP(clp).update({ useMasterKey: true });
+      await new Parse.Schema('resolutions_SignerWeight').setCLP(clp).update({ useMasterKey: true });
+    } catch (clpErr) {
+      console.warn('[resolutions] CLP update failed (non-fatal):', clpErr?.message);
     }
 
     return { success: true };
@@ -178,7 +215,8 @@ async function checkThresholds(documentId) {
       `[resolutions] checkThresholds doc=${documentId} ratioA=${ratioA.toFixed(3)}/${thresholdA} ratioB=${ratioB.toFixed(3)}/${thresholdB}`
     );
 
-    return ratioA >= thresholdA && ratioB >= thresholdB;
+    // Spec requires strict greater-than (>75%, >50%), not >=
+    return ratioA > thresholdA && ratioB > thresholdB;
   } catch (err) {
     console.error('[resolutions] checkThresholds error:', err);
     return false;
@@ -288,19 +326,7 @@ Parse.Cloud.define('approveForSigning', async req => {
     throw new Parse.Error(Parse.Error.INVALID_QUERY, 'Missing required parameter: documentId');
   }
 
-  // Auth: require master key or admin role
-  if (!req.master) {
-    if (!req.user) {
-      throw new Parse.Error(Parse.Error.INVALID_SESSION_TOKEN, 'Authentication required.');
-    }
-    const roleQuery = new Parse.Query(Parse.Role);
-    roleQuery.equalTo('name', 'admin');
-    roleQuery.equalTo('users', req.user);
-    const adminRole = await roleQuery.first({ useMasterKey: true });
-    if (!adminRole) {
-      throw new Parse.Error(Parse.Error.OPERATION_FORBIDDEN, 'Admin role required.');
-    }
-  }
+  await requireAdmin(req);
 
   try {
     const docPtr = { __type: 'Pointer', className: 'contracts_Document', objectId: documentId };
@@ -436,6 +462,8 @@ async function sendInviteEmails(documentId) {
 // ─── E. importResolutionSchema ────────────────────────────────────────────────
 
 Parse.Cloud.define('importResolutionSchema', async req => {
+  await requireAdmin(req);
+
   const {
     documentId,
     thresholdA = 0.75,
@@ -523,21 +551,21 @@ Parse.Cloud.define('importResolutionSchema', async req => {
         // Group positions by page number
         const pageMap = {};
         for (const f of emailFields) {
-          const pageNo = f.page ?? 0;
-          if (!pageMap[pageNo]) pageMap[pageNo] = [];
-          pageMap[pageNo].push({
+          const pageNumber = f.page ?? 1;
+          if (!pageMap[pageNumber]) pageMap[pageNumber] = [];
+          pageMap[pageNumber].push({
             type: f.type || 'signature',
-            x: f.x ?? 0,
-            y: f.y ?? 0,
-            width: f.width ?? 100,
-            height: f.height ?? 50,
+            xPosition: f.x ?? 0,
+            yPosition: f.y ?? 0,
+            Width: f.width ?? 100,
+            Height: f.height ?? 50,
             label: f.label || '',
             options: { response: '' },
           });
         }
 
-        const placeHolderPages = Object.entries(pageMap).map(([pageNo, pos]) => ({
-          pageNo: Number(pageNo),
+        const placeHolderPages = Object.entries(pageMap).map(([pageNumber, pos]) => ({
+          pageNumber: Number(pageNumber),
           pos,
         }));
 
