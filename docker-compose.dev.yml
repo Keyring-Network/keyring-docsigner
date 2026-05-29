@@ -1,0 +1,45 @@
+# Docker Compose override for local development.
+# Builds images from source instead of pulling pre-built ones from Docker Hub.
+# Also mounts source directories so that code changes can be picked up
+# without a full rebuild (where the runtime supports hot-reload).
+#
+# Usage:
+#   docker-compose -f docker-compose.yml -f docker-compose.dev.yml up --build
+#
+# Note: The Dockerhubfiles use the REPO ROOT as their build context (they
+# reference paths like apps/OpenSign/... and apps/OpenSignServer/...), so the
+# build context must be the repo root, not the individual app directory.
+
+services:
+  server:
+    build:
+      context: .
+      dockerfile: apps/OpenSignServer/Dockerhubfile
+    image: opensign/opensignserver:local
+    environment:
+      - NODE_ENV=development
+    volumes:
+      # Persist uploaded files across restarts
+      - opensign-files:/usr/src/app/files
+      # Mount source for iterative development.
+      # Changes to cloud functions / utils take effect after container restart
+      # (nodemon is not wired up in the default CMD, but you can override it).
+      - ./apps/OpenSignServer/cloud:/usr/src/app/cloud
+      - ./apps/OpenSignServer/utils:/usr/src/app/utils
+      - ./apps/OpenSignServer/auth:/usr/src/app/auth
+      - ./apps/OpenSignServer/migrationdb:/usr/src/app/migrationdb
+      - ./apps/OpenSignServer/Utils.js:/usr/src/app/Utils.js
+      - ./apps/OpenSignServer/index.js:/usr/src/app/index.js
+
+  client:
+    build:
+      context: .
+      dockerfile: apps/OpenSign/Dockerhubfile
+    image: opensign/opensign:local
+    environment:
+      - NODE_ENV=development
+    # The client build is compiled at image-build time (Vite SPA build).
+    # Source volume mounts are intentionally omitted here: Vite builds to
+    # ./build/ inside the image, and server.cjs serves that static output.
+    # To iterate on frontend code without a full rebuild, run Vite's dev
+    # server directly on the host instead (see DEVELOPMENT.md).
