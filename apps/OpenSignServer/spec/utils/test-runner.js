@@ -1,6 +1,5 @@
 import http from 'http';
 import { ParseServer } from 'parse-server';
-import { app, config } from '../../index.js';
 
 export const dropDB = async () => {
   await Parse.User.logOut();
@@ -8,15 +7,29 @@ export const dropDB = async () => {
 };
 let parseServerState = {};
 
+function ensureTestEnv() {
+  process.env.APP_ID = process.env.APP_ID || 'test';
+  process.env.MASTER_KEY = process.env.MASTER_KEY || 'test';
+  process.env.SERVER_URL = process.env.SERVER_URL || 'http://localhost:30001/test';
+  process.env.USE_LOCAL = process.env.USE_LOCAL || 'true';
+}
+
+function testDatabaseURI() {
+  const uri = process.env.MONGODB_URI || 'mongodb://localhost:27017/parse-test';
+  return uri.endsWith('/') ? `${uri}parse-test` : uri;
+}
+
 /**
  * Starts the ParseServer instance
  * @param {Object} parseServerOptions Used for creating the `ParseServer`
  * @return {Promise} Runner state
  */
 export async function startParseServer() {
+  ensureTestEnv();
+  const { app, config } = await import('../../index.js');
   delete config.databaseAdapter;
   const parseServerOptions = Object.assign(config, {
-    databaseURI: 'mongodb://localhost:27017/parse-test',
+    databaseURI: testDatabaseURI(),
     masterKey: 'test',
     javascriptKey: 'test',
     appId: 'test',
@@ -44,6 +57,9 @@ export async function startParseServer() {
  * @return {Promise}
  */
 export async function stopParseServer() {
-  await new Promise(resolve => parseServerState.httpServer.close(resolve));
+  if (parseServerState.httpServer) {
+    await new Promise(resolve => parseServerState.httpServer.close(resolve));
+  }
+  await parseServerState.parseServer?.stop?.();
   parseServerState = {};
 }
