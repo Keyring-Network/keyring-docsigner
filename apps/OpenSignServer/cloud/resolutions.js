@@ -12,8 +12,12 @@
  */
 
 import sendSystemMail from './parsefunction/sendSystemMail.js';
-import { appName, cloudServerUrl, serverAppId, mailTemplate } from '../Utils.js';
+import { appName, cloudServerUrl, serverAppId, mailTemplate, getSecureUrl } from '../Utils.js';
 import axios from 'axios';
+import { PDFDocument, rgb } from 'pdf-lib';
+import fontkit from '@pdf-lib/fontkit';
+import fs from 'node:fs';
+import { parseUploadFile } from '../utils/fileUtils.js';
 
 const serverUrl = cloudServerUrl;
 const appId = serverAppId;
@@ -226,14 +230,245 @@ async function checkThresholds(documentId) {
 // ─── C. executeDocument(documentId) ──────────────────────────────────────────
 
 /**
- * Marks the resolution as EXECUTED and stamps executedAt on the document.
- * Full PDF overlay with pdf-lib goes here in M6.
+ * Coordinate transform: converts a widget's stored pixel position (top-left
+ * origin, viewport-relative) into pdf-lib coordinates (bottom-left origin,
+ * PDF-point units) for a given page.
+ *
+ * The stored format mirrors the frontend (Utils.js / widgetUtils.js):
+ *   pos.xPosition  — pixels from left of the rendered container
+ *   pos.yPosition  — pixels from top of the rendered container
+ *   pos.Width      — widget width in rendered pixels
+ *   pos.Height     — widget height in rendered pixels
+ *   pos.vpWidth    — container pixel width at the time the widget was placed
+ *                    (used as the scaling reference; defaults to pageWidth if absent)
+ *
+ * This is the same algebra used in the frontend getWidgetPosition() function.
+ */
+function widgetToPdfCoords(pos, page) {
+  const { y: cropY, width: cropW, height: cropH } = page.getCropBox();
+  const pageWidth = cropW;
+  const pageHeight = cropH + cropY; // total height including any cropY offset
+
+  const vpWidth = pos.vpWidth || pageWidth;
+  const pageRatio = pageWidth / vpWidth;
+
+  const scaledX = (pos.xPosition || 0) * pageRatio;
+  const scaledY = (pos.yPosition || 0) * pageRatio;
+  const scaledW = (pos.Width || 100) * pageRatio;
+  const scaledH = (pos.Height || 40) * pageRatio;
+
+  // Convert from "y from top" (browser) to "y from bottom" (pdf-lib)
+  const pdfX = scaledX;
+  const pdfY = pageHeight - scaledY - scaledH;
+
+  return { x: pdfX, y: pdfY, width: scaledW, height: scaledH };
+}
+
+/**
+ * Builds a map of { signerObjectId → { email, signatureBase64, placeholder } }
+ * by combining:
+ *   - AuditTrail entries (activity=Signed, contain Signature base64)
+ *   - Signers array (contracts_Contactbook pointers, for email lookup)
+ *   - Placeholders array (per-signer field positions with options.response = value)
+ */
+function buildSignerDataMap(doc) {
+  const _doc = typeof doc.toJSON === 'function' ? doc.toJSON() : doc;
+
+  const auditTrail = _doc.AuditTrail || [];
+  const signers = _doc.Signers || [];
+  const placeholders = _doc.Placeholders || [];
+
+  // AuditTrail entry: { UserPtr: { objectId }, Activity, Signature, SignedUrl, SignedOn }
+  const signedEntries = auditTrail.filter(e => e?.Activity === 'Signed' && e?.UserPtr?.objectId);
+
+  const signerMap = {};
+
+  for (const entry of signedEntries) {
+    const objId = entry.UserPtr.objectId;
+
+    // Resolve email from the Signers array (contracts_Contactbook)
+    const signerContact = signers.find(s => (s.objectId || s.id) === objId);
+    const email = (signerContact?.Email || '').toLowerCase();
+
+    // Find this signer's placeholder entry to get field positions + responses
+    const placeholder = placeholders.find(
+      p => (p?.signerObjId || p?.signerPtr?.objectId) === objId
+    );
+
+    signerMap[objId] = {
+      email,
+      signatureBase64: entry.Signature || null, // base64 PNG of the signature drawn on the pad
+      signedUrl: entry.SignedUrl || null,
+      placeholder,
+    };
+  }
+
+  return signerMap;
+}
+
+/**
+ * Overlays one signer's signed fields onto the pdfDoc.
+ *
+ * Fields come from the placeholder.placeHolder array:
+ *   [ { pageNumber, pos: [ { type, xPosition, yPosition, Width, Height, vpWidth, options: { response } } ] } ]
+ *
+ * For image types (signature, initials, stamp) the value is a base64 PNG in options.response.
+ * For text types (name, job title, date, email, "weight factor", text, etc.) the value is a
+ * string in options.response.
+ *
+ * If options.response is absent for a signature field, falls back to the AuditTrail Signature
+ * base64 so legacy documents without per-field response still get rendered.
+ */
+async function overlaySignerFields(pdfDoc, placeholder, signerData, font) {
+  if (!placeholder?.placeHolder) return;
+
+  const pages = pdfDoc.getPages();
+  const imgTypeWidgets = ['signature', 'stamp', 'initials', 'image', 'draw'];
+
+  for (const phPage of placeholder.placeHolder) {
+    // placeHolder entries use `pageNumber` (frontend convention).
+    // Older server-side data may use `pageNo` — handle both.
+    const rawPageNo = phPage.pageNumber ?? phPage.pageNo ?? 1;
+    const page = pages[rawPageNo - 1];
+    if (!page) continue;
+
+    for (const pos of phPage.pos || []) {
+      const response = pos?.options?.response;
+      const type = pos.type || 'signature';
+
+      // Skip fields with no value and no fallback
+      if (!response && !(imgTypeWidgets.includes(type) && signerData.signatureBase64)) continue;
+
+      const coords = widgetToPdfCoords(pos, page);
+
+      try {
+        if (imgTypeWidgets.includes(type)) {
+          // Prefer per-field response; fall back to AuditTrail Signature for legacy
+          const imgBase64 = response || signerData.signatureBase64;
+          if (!imgBase64) continue;
+
+          // Strip data-URI prefix if present
+          const raw = imgBase64.replace(/^data:[^;]+;base64,/, '');
+          const imgBytes = Buffer.from(raw, 'base64');
+
+          // Detect PNG vs JPEG by magic bytes (0x89 0x50 = PNG header)
+          const isPng = imgBytes[0] === 0x89 && imgBytes[1] === 0x50;
+          const embeddedImg = isPng
+            ? await pdfDoc.embedPng(imgBytes)
+            : await pdfDoc.embedJpg(imgBytes);
+
+          page.drawImage(embeddedImg, {
+            x: coords.x,
+            y: coords.y,
+            width: coords.width,
+            height: coords.height,
+          });
+        } else {
+          // Text widget: name, job title, date, email, weight factor, text input, etc.
+          const textValue = String(response ?? '');
+          if (!textValue) continue;
+
+          const fontSize = parseInt(pos?.options?.fontSize || 12, 10);
+          const pdfColor = parseFontColor(pos?.options?.fontColor);
+
+          page.drawText(textValue, {
+            x: coords.x,
+            // Vertically centre the text within the field box
+            y: coords.y + coords.height / 2 - fontSize / 2,
+            size: fontSize,
+            font,
+            color: pdfColor,
+            maxWidth: coords.width,
+          });
+        }
+      } catch (fieldErr) {
+        console.error(
+          `[resolutions] overlay field error type=${type} page=${rawPageNo}:`,
+          fieldErr?.message || fieldErr
+        );
+        // Continue with remaining fields — one bad field must not abort the whole PDF
+      }
+    }
+  }
+}
+
+/**
+ * Parse a CSS-style colour string (hex #rrggbb / #rgb, or rgb(r,g,b)) into
+ * pdf-lib's rgb().  Falls back to black on any parse failure.
+ */
+function parseFontColor(color) {
+  if (!color) return rgb(0, 0, 0);
+  try {
+    if (color.startsWith('#')) {
+      const hex = color.slice(1);
+      const full = hex.length === 3
+        ? hex.split('').map(c => c + c).join('')
+        : hex;
+      return rgb(
+        parseInt(full.slice(0, 2), 16) / 255,
+        parseInt(full.slice(2, 4), 16) / 255,
+        parseInt(full.slice(4, 6), 16) / 255
+      );
+    }
+    if (color.startsWith('rgb')) {
+      const nums = color.match(/[\d.]+/g) || [];
+      return rgb(
+        parseFloat(nums[0] || 0) / 255,
+        parseFloat(nums[1] || 0) / 255,
+        parseFloat(nums[2] || 0) / 255
+      );
+    }
+  } catch {
+    // fall through to default
+  }
+  return rgb(0, 0, 0);
+}
+
+/**
+ * Stamps a small "EXECUTED <date>" label in the top-right corner of every page.
+ */
+function stampExecutedBanner(pdfDoc, font, executedAt) {
+  const dateStr = executedAt.toLocaleDateString('en-US', {
+    month: 'short',
+    day: 'numeric',
+    year: 'numeric',
+  });
+  const label = `EXECUTED ${dateStr}`;
+  const fontSize = 10;
+
+  for (const page of pdfDoc.getPages()) {
+    const { width, height } = page.getSize();
+    const textWidth = font.widthOfTextAtSize(label, fontSize);
+    const margin = 10;
+
+    page.drawText(label, {
+      x: width - textWidth - margin,
+      y: height - fontSize - margin,
+      size: fontSize,
+      font,
+      color: rgb(0.18, 0.55, 0.34), // dark green
+    });
+  }
+}
+
+/**
+ * Marks the resolution as EXECUTED:
+ *  1. Updates resolutions_Threshold status → EXECUTED and stamps executedAt on the document
+ *  2. Fetches the latest signed PDF, loads it with pdf-lib
+ *  3. For each signer that signed, overlays their field responses (signature images + text)
+ *  4. Stamps an EXECUTED banner on every page
+ *  5. Uploads the executed PDF and stores its URL as contracts_Document.ExecutedFileUrl
+ *  6. Sends execution confirmation emails to all signers and the document owner
+ *
+ * PDF generation failures are non-fatal: the document is still marked EXECUTED and
+ * notification emails are still sent.  The PDF can be regenerated separately.
  */
 async function executeDocument(documentId) {
-  try {
-    const docPtr = { __type: 'Pointer', className: 'contracts_Document', objectId: documentId };
+  const executedAt = new Date();
+  const docPtr = { __type: 'Pointer', className: 'contracts_Document', objectId: documentId };
 
-    // Update resolutions_Threshold status to EXECUTED
+  // ── Step 1: mark EXECUTED immediately (fatal if this fails) ─────────────────
+  try {
     const tQuery = new Parse.Query('resolutions_Threshold');
     tQuery.equalTo('document', docPtr);
     const threshold = await tQuery.first({ useMasterKey: true });
@@ -242,28 +477,104 @@ async function executeDocument(documentId) {
       await threshold.save(null, { useMasterKey: true });
     }
 
-    // Stamp executedAt on the contracts_Document
     const docObj = new Parse.Object('contracts_Document');
     docObj.id = documentId;
-    docObj.set('executedAt', new Date());
+    docObj.set('executedAt', executedAt);
     await docObj.save(null, { useMasterKey: true });
-
-    console.log(`[resolutions] Document ${documentId} executed — PDF generation pending M6`);
-
-    // TODO (M6): PDF overlay with pdf-lib goes here.
-    // Generate a completed/executed PDF combining all signer annotations,
-    // stamp an "EXECUTED" watermark, and store the final URL on the document.
-
-    // Send notification emails to all signers
-    await sendExecutionNotification(documentId);
   } catch (err) {
-    console.error('[resolutions] executeDocument error:', err);
+    console.error('[resolutions] executeDocument — failed to mark EXECUTED:', err);
     throw err;
   }
+
+  // ── Step 2: generate the executed PDF overlay (non-fatal) ───────────────────
+  try {
+    // Fetch the document with all related signer and placeholder data
+    const docQuery = new Parse.Query('contracts_Document');
+    docQuery.include('ExtUserPtr');
+    docQuery.include('Signers');
+    const doc = await docQuery.get(documentId, { useMasterKey: true });
+
+    const _doc = doc.toJSON();
+
+    // Use the most recent signed PDF, falling back to the original upload
+    const pdfUrl = _doc.SignedUrl || _doc.URL;
+    if (!pdfUrl) {
+      throw new Error('Document has no PDF URL (SignedUrl or URL)');
+    }
+
+    // Download the PDF bytes
+    const pdfResponse = await axios.get(pdfUrl, { responseType: 'arraybuffer' });
+    const pdfBytes = Buffer.from(pdfResponse.data);
+
+    // Load the document
+    const pdfDoc = await PDFDocument.load(pdfBytes, { ignoreEncryption: true });
+
+    // Embed a font for text overlays.  Use the same Times New Roman TTF used
+    // elsewhere in the codebase (GenerateCertificate.js).
+    pdfDoc.registerFontkit(fontkit);
+    let font;
+    const localFontPath = './font/times.ttf';
+    if (fs.existsSync(localFontPath)) {
+      const fontBytesData = fs.readFileSync(localFontPath);
+      font = await pdfDoc.embedFont(fontBytesData, { subset: true });
+    } else {
+      // Fall back to the standard Times-Roman Type-1 font if the TTF is absent
+      const { StandardFonts } = await import('pdf-lib');
+      font = await pdfDoc.embedFont(StandardFonts.TimesRoman);
+    }
+
+    // Build the signer data map and overlay each signer's fields
+    const signerMap = buildSignerDataMap(_doc);
+    for (const signerData of Object.values(signerMap)) {
+      if (signerData.placeholder) {
+        await overlaySignerFields(pdfDoc, signerData.placeholder, signerData, font);
+      }
+    }
+
+    // Stamp the EXECUTED banner on every page
+    stampExecutedBanner(pdfDoc, font, executedAt);
+
+    // Serialise to bytes
+    const executedPdfBytes = await pdfDoc.save({ useObjectStreams: false });
+
+    // Upload via the Parse file API (same pattern as PDF.js / generateCertificatebydocId.js)
+    const docName = (_doc.Name || 'resolution')
+      .replace(/[^a-zA-Z0-9._-]/g, '_')
+      .toLowerCase()
+      .slice(0, 80);
+    const uploadFilename = `executed_${docName}_${documentId}.pdf`;
+
+    const fileRes = await parseUploadFile(
+      uploadFilename,
+      Buffer.from(executedPdfBytes),
+      'application/pdf'
+    );
+    const executedFileUrl = getSecureUrl(fileRes?.url)?.url || fileRes?.url;
+
+    if (executedFileUrl) {
+      const updateDoc = new Parse.Object('contracts_Document');
+      updateDoc.id = documentId;
+      updateDoc.set('ExecutedFileUrl', executedFileUrl);
+      await updateDoc.save(null, { useMasterKey: true });
+      console.log(`[resolutions] Executed PDF stored: ${executedFileUrl}`);
+    }
+  } catch (pdfErr) {
+    // PDF generation failure is non-fatal; log and fall through to notifications
+    console.error(
+      '[resolutions] executeDocument — PDF generation failed (document still EXECUTED):',
+      pdfErr?.message || pdfErr
+    );
+  }
+
+  // ── Step 3: send notification emails (non-fatal) ─────────────────────────────
+  await sendExecutionNotification(documentId);
+
+  console.log(`[resolutions] Document ${documentId} executed`);
 }
 
 /**
- * Sends a "resolution executed" notification email to all signers on the document.
+ * Sends a "resolution executed" notification email to all signers on the document
+ * and to the document owner.
  */
 async function sendExecutionNotification(documentId) {
   try {
@@ -472,14 +783,106 @@ Parse.Cloud.define('importResolutionSchema', async req => {
     fields = [],
   } = req.params;
 
+  // ── Validate required params ─────────────────────────────────────────────────
   if (!documentId) {
     throw new Parse.Error(Parse.Error.INVALID_QUERY, 'Missing required parameter: documentId');
+  }
+  if (typeof thresholdA !== 'number' || thresholdA < 0 || thresholdA > 1) {
+    throw new Parse.Error(
+      Parse.Error.INVALID_QUERY,
+      'thresholdA must be a number between 0 and 1'
+    );
+  }
+  if (typeof thresholdB !== 'number' || thresholdB < 0 || thresholdB > 1) {
+    throw new Parse.Error(
+      Parse.Error.INVALID_QUERY,
+      'thresholdB must be a number between 0 and 1'
+    );
+  }
+  if (!Array.isArray(signers) || signers.length === 0) {
+    throw new Parse.Error(
+      Parse.Error.INVALID_QUERY,
+      'signers[] must be a non-empty array'
+    );
+  }
+
+  // Validate each signer entry
+  const signerEmailSet = new Set();
+  for (let i = 0; i < signers.length; i++) {
+    const s = signers[i];
+    if (!s?.email) {
+      throw new Parse.Error(
+        Parse.Error.INVALID_QUERY,
+        `signers[${i}].email is required`
+      );
+    }
+    const emailNorm = s.email.toLowerCase();
+    if (signerEmailSet.has(emailNorm)) {
+      throw new Parse.Error(
+        Parse.Error.INVALID_QUERY,
+        `Duplicate signer email: ${s.email}`
+      );
+    }
+    signerEmailSet.add(emailNorm);
+    if (typeof s.weightGroupA !== 'number' || s.weightGroupA < 0) {
+      throw new Parse.Error(
+        Parse.Error.INVALID_QUERY,
+        `signers[${i}].weightGroupA must be a non-negative number`
+      );
+    }
+    if (typeof s.weightGroupB !== 'number' || s.weightGroupB < 0) {
+      throw new Parse.Error(
+        Parse.Error.INVALID_QUERY,
+        `signers[${i}].weightGroupB must be a non-negative number`
+      );
+    }
+  }
+
+  // Validate each field entry
+  const validFieldTypes = [
+    'signature', 'initials', 'stamp', 'image', 'draw',
+    'name', 'job title', 'company', 'date', 'email',
+    'weight factor', 'text', 'textarea', 'number', 'checkbox', 'radio', 'dropdown',
+  ];
+  if (Array.isArray(fields)) {
+    for (let i = 0; i < fields.length; i++) {
+      const f = fields[i];
+      if (!f?.signerEmail) {
+        throw new Parse.Error(
+          Parse.Error.INVALID_QUERY,
+          `fields[${i}].signerEmail is required`
+        );
+      }
+      if (f.type && !validFieldTypes.includes(f.type)) {
+        throw new Parse.Error(
+          Parse.Error.INVALID_QUERY,
+          `fields[${i}].type "${f.type}" is not a recognised field type`
+        );
+      }
+      if (typeof f.page !== 'number' || f.page < 1) {
+        throw new Parse.Error(
+          Parse.Error.INVALID_QUERY,
+          `fields[${i}].page must be a positive integer (1-indexed)`
+        );
+      }
+      for (const dim of ['x', 'y', 'width', 'height']) {
+        if (f[dim] !== undefined && typeof f[dim] !== 'number') {
+          throw new Parse.Error(
+            Parse.Error.INVALID_QUERY,
+            `fields[${i}].${dim} must be a number`
+          );
+        }
+      }
+    }
   }
 
   try {
     const docPtr = { __type: 'Pointer', className: 'contracts_Document', objectId: documentId };
 
-    // ── Create/replace resolutions_Threshold ──
+    // Verify the document exists before writing anything
+    await new Parse.Query('contracts_Document').get(documentId, { useMasterKey: true });
+
+    // ── Upsert resolutions_Threshold ──────────────────────────────────────────
     const tQuery = new Parse.Query('resolutions_Threshold');
     tQuery.equalTo('document', docPtr);
     const existing = await tQuery.first({ useMasterKey: true });
@@ -488,15 +891,17 @@ Parse.Cloud.define('importResolutionSchema', async req => {
     thresholdObj.set('document', Parse.Object.fromJSON({ ...docPtr, className: 'contracts_Document' }));
     thresholdObj.set('thresholdA', thresholdA);
     thresholdObj.set('thresholdB', thresholdB);
-    // Only set status to DRAFT if this is a new record
+    // Preserve existing status on update; only set DRAFT on first creation.
     if (!existing) {
       thresholdObj.set('status', 'DRAFT');
     }
     const savedThreshold = await thresholdObj.save(null, { useMasterKey: true });
     const thresholdId = savedThreshold.id;
 
-    // ── Create/replace resolutions_SignerWeight records ──
-    // Delete existing weight records for this document first
+    // ── Upsert resolutions_SignerWeight records ───────────────────────────────
+    // Destroy all existing weight records for this document and recreate them.
+    // This is a hard cutover: if the signers list changes, the old records are
+    // removed unconditionally rather than attempting a per-email upsert.
     const swQuery = new Parse.Query('resolutions_SignerWeight');
     swQuery.equalTo('document', docPtr);
     swQuery.limit(1000);
@@ -509,28 +914,55 @@ Parse.Cloud.define('importResolutionSchema', async req => {
     for (const signer of signers) {
       const sw = new Parse.Object('resolutions_SignerWeight');
       sw.set('document', Parse.Object.fromJSON({ ...docPtr, className: 'contracts_Document' }));
-      sw.set('signerEmail', signer.email || '');
-      sw.set('weightGroupA', signer.weightGroupA ?? 0);
-      sw.set('weightGroupB', signer.weightGroupB ?? 0);
+      sw.set('signerEmail', signer.email.toLowerCase());
+      sw.set('weightGroupA', signer.weightGroupA);
+      sw.set('weightGroupB', signer.weightGroupB);
       sw.set('excludedFromB', signer.excludedFromB ?? false);
       const savedSw = await sw.save(null, { useMasterKey: true });
       signerWeightIds.push(savedSw.id);
     }
 
-    // ── Store field positions on contracts_Document.Placeholders ──
-    // Placeholders use the same structure as the rest of OpenSign:
-    //   [{signerPtr, signerObjId, email, Role, placeHolder: [{pageNo, pos: [{type, x, y, width, height, label}]}]}]
+    // ── Upsert field positions on contracts_Document.Placeholders ─────────────
     //
-    // We merge incoming fields (grouped by signerEmail) into the existing
-    // Placeholders array, adding position data without disturbing ACL or other
-    // document fields.
+    // The OpenSign Placeholders format (one entry per signer):
+    //   {
+    //     signerObjId: string,       // objectId of contracts_Contactbook (empty for email-only)
+    //     signerPtr: { objectId },   // pointer (empty for email-only)
+    //     email: string,             // lowercase signer email
+    //     Role: 'signer'|'prefill',
+    //     placeHolder: [             // one entry per page that has fields
+    //       {
+    //         pageNumber: number,    // 1-indexed (matches frontend convention)
+    //         pos: [                 // fields on this page
+    //           {
+    //             type: string,      // 'signature'|'name'|'date'|'weight factor'|etc.
+    //             xPosition: number, // pixels from left of rendered container
+    //             yPosition: number, // pixels from top of rendered container
+    //             Width: number,     // widget width in rendered pixels
+    //             Height: number,    // widget height in rendered pixels
+    //             // vpWidth is intentionally absent at import time; executeDocument
+    //             // defaults to page width which gives correct 1:1 pixel mapping.
+    //             label: string,
+    //             options: { response: '' },
+    //           }
+    //         ]
+    //       }
+    //     ]
+    //   }
+    //
+    // Incoming fields use { page, x, y, width, height } as pixel values in the
+    // rendered viewport; we store them under the frontend key names so the
+    // overlay coordinate transform in executeDocument works without translation.
+    let fieldCount = 0;
+
     if (Array.isArray(fields) && fields.length > 0) {
-      // Group fields by signerEmail
+      // Group fields by signerEmail (normalised to lowercase)
       const fieldsByEmail = {};
       for (const f of fields) {
         const email = (f.signerEmail || '').toLowerCase();
         if (!fieldsByEmail[email]) fieldsByEmail[email] = [];
         fieldsByEmail[email].push(f);
+        fieldCount++;
       }
 
       // Fetch the current document to read existing Placeholders
@@ -539,16 +971,15 @@ Parse.Cloud.define('importResolutionSchema', async req => {
       });
       const existingPlaceholders = docFetch.get('Placeholders') || [];
 
-      // Build updated Placeholders: one entry per signer with pos arrays
       const updatedPlaceholders = [...existingPlaceholders];
 
       for (const [email, emailFields] of Object.entries(fieldsByEmail)) {
-        // Find existing placeholder for this signer (match by email field)
+        // Find existing placeholder entry for this signer
         const existingIdx = updatedPlaceholders.findIndex(
           p => (p?.email || '').toLowerCase() === email
         );
 
-        // Group positions by page number
+        // Group fields by page number (1-indexed)
         const pageMap = {};
         for (const f of emailFields) {
           const pageNumber = f.page ?? 1;
@@ -559,6 +990,7 @@ Parse.Cloud.define('importResolutionSchema', async req => {
             yPosition: f.y ?? 0,
             Width: f.width ?? 100,
             Height: f.height ?? 50,
+            // vpWidth omitted intentionally: executeDocument defaults to page width
             label: f.label || '',
             options: { response: '' },
           });
@@ -570,13 +1002,13 @@ Parse.Cloud.define('importResolutionSchema', async req => {
         }));
 
         if (existingIdx >= 0) {
-          // Merge: replace placeHolder positions for this signer
+          // Upsert: replace placeHolder pages for this signer, preserve meta fields
           updatedPlaceholders[existingIdx] = {
             ...updatedPlaceholders[existingIdx],
             placeHolder: placeHolderPages,
           };
         } else {
-          // Append a new placeholder entry for this email-only signer
+          // New placeholder entry for a signer not yet in the document
           updatedPlaceholders.push({
             email,
             signerObjId: '',
@@ -591,7 +1023,12 @@ Parse.Cloud.define('importResolutionSchema', async req => {
       await docFetch.save(null, { useMasterKey: true });
     }
 
-    return { success: true, thresholdId, signerWeightIds };
+    return {
+      success: true,
+      thresholdId,
+      signerWeightCount: signerWeightIds.length,
+      fieldCount,
+    };
   } catch (err) {
     console.error('[resolutions] importResolutionSchema error:', err);
     throw err;
