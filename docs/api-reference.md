@@ -44,7 +44,11 @@ Call this before `approveForSigning`. The document status will be `DRAFT` after 
 
 ### Authentication
 
-No special authentication required (master key used internally). Any authenticated session can call this function; restrict access at the network/role level if needed.
+Requires either:
+- A session belonging to a user with `contracts_Admin` or `contracts_OrgAdmin` in the `contracts_Users.UserRole` field, **or**
+- The Parse master key.
+
+Any other caller receives a `119` (OPERATION_FORBIDDEN) error.
 
 ### Parameters
 
@@ -69,14 +73,14 @@ No special authentication required (master key used internally). Any authenticat
 
 | Field | Type | Required | Default | Description |
 |-------|------|----------|---------|-------------|
-| `signerEmail` | string | Yes | — | Email of the signer this field belongs to |
+| `signerEmail` | string | Yes | — | Email of the signer this field belongs to; must match an email in `signers[]` |
 | `type` | string | No | `"signature"` | Field type: `"signature"`, `"name"`, `"job title"`, `"date"`, `"weight factor"`, etc. |
 | `label` | string | No | `""` | Display label for `weight factor` fields |
-| `page` | number | No | `0` | 0-indexed page number |
-| `x` | number | No | `0` | X position as a fraction of page width (0–1) |
-| `y` | number | No | `0` | Y position as a fraction of page height (0–1) |
-| `width` | number | No | `100` | Field width in the same coordinate space as x/y |
-| `height` | number | No | `50` | Field height |
+| `page` | number | No | `1` | 1-indexed page number (minimum 1) |
+| `x` | number | No | `0` | X position in rendered-viewport pixels from left edge |
+| `y` | number | No | `0` | Y position in rendered-viewport pixels from top edge |
+| `width` | number | No | `100` | Field width in rendered-viewport pixels |
+| `height` | number | No | `50` | Field height in rendered-viewport pixels |
 
 ### Returns
 
@@ -129,20 +133,20 @@ No special authentication required (master key used internally). Any authenticat
       "signerEmail": "alice@example.com",
       "type": "signature",
       "page": 2,
-      "x": 0.10,
-      "y": 0.78,
-      "width": 0.25,
-      "height": 0.06
+      "x": 102,
+      "y": 780,
+      "width": 250,
+      "height": 60
     },
     {
       "signerEmail": "alice@example.com",
       "type": "weight factor",
       "label": "Shares Held",
       "page": 2,
-      "x": 0.40,
-      "y": 0.78,
-      "width": 0.15,
-      "height": 0.04
+      "x": 400,
+      "y": 780,
+      "width": 150,
+      "height": 40
     }
   ]
 }
@@ -169,10 +173,10 @@ Transitions a document from `DRAFT` to `ACTIVE` and sends invite emails to all s
 ### Authentication
 
 Requires either:
-- A session belonging to a user in the `admin` Parse role, **or**
+- A session belonging to a user with `contracts_Admin` or `contracts_OrgAdmin` in the `contracts_Users.UserRole` field, **or**
 - The Parse master key.
 
-Any other caller receives a `206` (OPERATION_FORBIDDEN) error.
+Any other caller receives a `119` (OPERATION_FORBIDDEN) error.
 
 ### Parameters
 
@@ -198,7 +202,7 @@ Any other caller receives a `206` (OPERATION_FORBIDDEN) error.
 |------|---------|---------|
 | `101` (INVALID_QUERY) | `Missing required parameter: documentId` | `documentId` not provided |
 | `209` (INVALID_SESSION_TOKEN) | `Authentication required.` | No user session and no master key |
-| `119` (OPERATION_FORBIDDEN) | `Admin role required.` | User is not a member of the `admin` role |
+| `119` (OPERATION_FORBIDDEN) | `Admin role required.` | User does not have `contracts_Admin` or `contracts_OrgAdmin` in `contracts_Users.UserRole` |
 | `101` (OBJECT_NOT_FOUND) | `No resolutions_Threshold found for document <id>` | `importResolutionSchema` has not been called for this document |
 
 ### Example

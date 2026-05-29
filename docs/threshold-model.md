@@ -11,7 +11,7 @@ ratioA = sum(weightGroupA for signers who have signed)
        / sum(weightGroupA for all signers)
 ```
 
-Group A passes when `ratioA >= thresholdA`.
+Group A passes when `ratioA > thresholdA`.
 
 This threshold represents the standard majority requirement: enough aggregate voting power has approved the resolution.
 
@@ -24,7 +24,7 @@ ratioB = sum(weightGroupB for non-excluded signers who have signed)
        / sum(weightGroupB for all non-excluded signers)
 ```
 
-Group B passes when `ratioB >= thresholdB`.
+Group B passes when `ratioB > thresholdB`.
 
 A single signer can be flagged `excludedFromB = true`. That signer's weight does not appear in either the numerator or denominator of the Group B calculation, regardless of whether they have signed. Their Group A weight is unaffected.
 
@@ -33,7 +33,7 @@ A single signer can be flagged `excludedFromB = true`. That signer's weight does
 Both thresholds must be met simultaneously:
 
 ```
-execute if (ratioA >= thresholdA) AND (ratioB >= thresholdB)
+execute if (ratioA > thresholdA) AND (ratioB > thresholdB)
 ```
 
 The check runs after every signing event. Execution triggers the first time the condition becomes true.
@@ -87,7 +87,7 @@ function checkThresholds(documentId):
   5. ratioA = signedA / totalA  (0 if totalA == 0)
      ratioB = signedB / totalB  (0 if totalB == 0)
 
-  6. return (ratioA >= thresholdA) AND (ratioB >= thresholdB)
+  6. return (ratioA > thresholdA) AND (ratioB > thresholdB)
 ```
 
 The function returns `true` (thresholds met), `false` (not met), or `null` (document has no active threshold record).
@@ -122,12 +122,14 @@ Result: `false`. No execution.
 
 Group A:
 - `signedA = 0.35 + 0.40 = 0.75`
-- `ratioA = 0.75 / 1.00 = 0.75` — meets 0.75, passed
+- `ratioA = 0.75 / 1.00 = 0.75` — exceeds 0.75, passed
 
 Group B:
 - `signedB = 0.45 + 0.55 = 1.00`
-- `ratioB = 1.00 / 1.00 = 1.00` — meets 0.50, passed
+- `ratioB = 1.00 / 1.00 = 1.00` — exceeds 0.50, passed
 
 Result: `true`. `executeDocument()` is called.
 
 Note: Carol has not signed. Because Carol is excluded from Group B, her absence does not affect the Group B calculation. Carol's Group A weight of 0.25 did not contribute to `signedA`, but her inclusion in `totalA` required Alice and Bob together to reach exactly 0.75 — the minimum required.
+
+**Boundary-case caveat:** `ratioA = 0.75` and `thresholdA = 0.75`. The implementation uses strict `>` so this exact value would NOT trigger execution. To trigger execution with these weights, Alice, Bob, and Carol must all sign (ratioA = 1.00), or weights must be chosen so the signed ratio strictly exceeds the threshold.
