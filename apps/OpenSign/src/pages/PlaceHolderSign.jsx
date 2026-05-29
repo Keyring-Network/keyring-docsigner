@@ -67,6 +67,7 @@ import * as utils from "../utils";
 import { resetWidgetState, setPrefillImg } from "../redux/reducers/widgetSlice";
 import EditDocument from "../components/pdf/EditTemplate";
 import CustomizeMail from "../components/pdf/CustomizeMail";
+import ResolutionThresholdConfig from "../components/pdf/ResolutionThresholdConfig";
 import { useWindowSize } from "../hook/useWindowSize";
 import { useScroll } from "../context/ScrollPdfContext";
 
@@ -715,7 +716,8 @@ function PlaceHolderSign() {
             "name",
             "company",
             "job title",
-            "email"
+            "email",
+            "weight factor"
           ].includes(dragTypeValue)
         ) {
           setFontSize(12);
@@ -2331,6 +2333,13 @@ function PlaceHolderSign() {
                       prefillSigner={prefillSigner}
                       setIsTour={setPlaceholderTour}
                     />
+                    {pdfDetails[0]?.IsResolution && (
+                      <ResolutionThresholdConfig
+                        signers={signersdata}
+                        documentId={documentId}
+                        onSaved={() => {}}
+                      />
+                    )}
                     <div data-tut="addWidgets">
                       <WidgetComponent
                         isMailSend={isMailSend}
