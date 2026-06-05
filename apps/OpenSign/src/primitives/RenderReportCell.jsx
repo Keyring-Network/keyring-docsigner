@@ -1,6 +1,7 @@
 import { useTranslation } from "react-i18next";
 import { formatDateToDdMmmYyyy } from "../constant/Utils";
 import SignerCell from "./SignerCell";
+import ResolutionProgress from "../components/dashboard/ResolutionProgress";
 
 function isValidDateString(str) {
   const date = new Date(str);
@@ -56,6 +57,7 @@ export const RenderReportCell = ({
               {t("expires")} {formatDateToDdMmmYyyy(rowData?.ExpiryDate?.iso)}
             </div>
           )}
+          <ResolutionProgress documentId={rowData?.objectId} />
         </td>
       );
     case "Reason":
