@@ -421,7 +421,8 @@
     "image": "image",
     "email": "email",
     "number": "number",
-    "draw": "draw"
+    "draw": "draw",
+    "weight factor": "Weight Factor"
   },
   "fields": "Fields",
   "recipients": "Recipients",

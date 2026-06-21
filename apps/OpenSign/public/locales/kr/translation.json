@@ -421,7 +421,8 @@
     "image": "이미지",
     "email": "이메일",
     "number": "숫자",
-    "draw": "그리기"
+    "draw": "그리기",
+    "weight factor": "가중치 인수"
   },
   "fields": "필드",
   "recipients": "수신자",

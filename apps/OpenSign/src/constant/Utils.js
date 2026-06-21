@@ -375,7 +375,8 @@ export const widgets = [
   },
   { type: radioButtonWidget, icon: "fa-light fa-circle-dot", iconSize: "20px" },
   { type: "image", icon: "fa-light fa-image", iconSize: "20px" },
-  { type: drawWidget, icon: "fa-light fa-pen-nib", iconSize: "20px" }
+  { type: drawWidget, icon: "fa-light fa-pen-nib", iconSize: "20px" },
+  { type: "weight factor", icon: "fa-light fa-weight-hanging", iconSize: "18px" }
 ];
 
 export const getDate = (dateformat) => {
@@ -570,6 +571,11 @@ export const addWidgetOptions = (
       return defaultOpt;
     case drawWidget:
       return defaultOpt;
+    case "weight factor":
+      return {
+        ...defaultOpt,
+        label: "Weight Factor"
+      };
     default:
       return {};
   }
@@ -631,6 +637,12 @@ export const addWidgetSelfsignOptions = (
         defaultValue: getWidgetValue(type),
         validation: { type: "text", pattern: "" }
       };
+    case "weight factor":
+      return {
+        ...defaultOpt,
+        label: "Weight Factor",
+        validation: { type: "text", pattern: "" }
+      };
     case "date": {
       const dateFormat = owner?.DateFormat
         ? selectFormat(owner?.DateFormat)
@@ -682,6 +694,8 @@ export const defaultWidthHeight = (type) => {
     case "company":
       return { width: 150, height: 19 };
     case "job title":
+      return { width: 150, height: 19 };
+    case "weight factor":
       return { width: 150, height: 19 };
     case "date":
       return { width: 100, height: 20 };
@@ -2044,7 +2058,8 @@ export const embedWidgetsToDoc = async (
         "company",
         "job title",
         "date",
-        "email"
+        "email",
+        "weight factor"
       ].includes(position.type);
       if (hasError) break; // Stop the inner loop if an error occurred
       try {

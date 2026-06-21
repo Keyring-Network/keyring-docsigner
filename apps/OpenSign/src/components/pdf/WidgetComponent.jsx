@@ -36,7 +36,8 @@ function WidgetComponent(props) {
     { id: 14, text: "dropdown" },
     { id: 15, text: radioButtonWidget },
     { id: 16, text: "image" },
-    { id: 17, text: drawWidget }
+    { id: 17, text: drawWidget },
+    { id: 18, text: "weight factor" }
   ];
 
   // Create all drag refs in one go
@@ -68,6 +69,7 @@ function WidgetComponent(props) {
         "date",
         "image",
         "checkbox",
+        "weight factor",
         drawWidget
       ].includes(data.type)
   );
@@ -85,12 +87,13 @@ function WidgetComponent(props) {
         "email",
         "job title",
         "company",
+        "weight factor",
         drawWidget
       ].includes(data.type)
   );
   const selfSignWidgets = widgetList.filter(
     (data) =>
-      !["dropdown", radioButtonWidget, textInputWidget, drawWidget].includes(
+      !["dropdown", radioButtonWidget, textInputWidget, "weight factor", drawWidget].includes(
         data.type
       )
   );
